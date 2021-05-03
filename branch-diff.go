@@ -18,6 +18,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -25,7 +27,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/antchfx/xmlquery"
 )
 
 var outputDirectory string
@@ -46,7 +51,7 @@ func main() {
 		}
 	}
 
-	copyFiles(files, outputDirectory)
+	copyFiles(files, outputDirectory, forkCommit)
 
 	return
 }
@@ -63,7 +68,7 @@ func forkPoint() string {
 	output, error := exec.Command("git", "merge-base", parentBranch, currentCommit).Output()
 
 	if error != nil {
-		log.Fatal("git merge-base: %s", error)
+		log.Fatalf("git merge-base: %s", error)
 	}
 
 	hash := strings.ReplaceAll(strings.ReplaceAll(string(output), "\r\n", "\n"), "\n", "")
@@ -75,7 +80,7 @@ func changeList(startCommit string, endCommit string) []string {
 	output, error := exec.Command("git", "diff", "--name-only", startCommit, endCommit).Output()
 
 	if error != nil {
-		log.Fatal("git diff: %s", error)
+		log.Fatalf("git diff: %s", error)
 	}
 
 	delimiterIgnoreEmptyItems := func(c rune) bool {
@@ -87,7 +92,7 @@ func changeList(startCommit string, endCommit string) []string {
 	return lines
 }
 
-func copyFiles(files []string, directory string) {
+func copyFiles(files []string, directory string, forkCommit string) {
 	os.RemoveAll(directory)
 
 	if verbose {
@@ -95,7 +100,16 @@ func copyFiles(files []string, directory string) {
 	}
 
 	for _, file := range files {
-		copyFile(file, directory, 0600)
+		if strings.HasSuffix(file, ".profile-meta.xml") {
+			content := profileDifferential(getFileFromCommit(file, forkCommit), getFileContent(file))
+			writeFile(file, directory, 0600, content)
+		} else {
+			copyFile(file, directory, 0600)
+		}
+
+		if strings.HasSuffix(file, "-meta.xml") {
+			continue
+		}
 
 		metaFile := file + "-meta.xml"
 		if fileExists(metaFile) {
@@ -104,11 +118,30 @@ func copyFiles(files []string, directory string) {
 	}
 }
 
+func writeFile(file string, directory string, permissions uint32, content string) {
+	destinationFile := filepath.Join(directory, file)
+	path := filepath.Dir(destinationFile)
+
+	os.MkdirAll(path, 0600)
+
+	input := []byte(content)
+	error := ioutil.WriteFile(destinationFile, input, 0600)
+
+	if error != nil {
+		log.Fatalf("file write[%s]: %s", destinationFile, error)
+	}
+
+	if verbose {
+		fmt.Printf("Created file %s\n", destinationFile)
+	}
+
+}
+
 func copyFile(file string, directory string, permissions uint32) {
 	input, error := ioutil.ReadFile(file)
 
 	if error != nil {
-		log.Fatal("file read[%s]: %s", file, error)
+		log.Fatalf("file read[%s]: %s", file, error)
 	}
 
 	destinationFile := filepath.Join(directory, file)
@@ -119,7 +152,7 @@ func copyFile(file string, directory string, permissions uint32) {
 	error = ioutil.WriteFile(destinationFile, input, 0600)
 
 	if error != nil {
-		log.Fatal("file write[%s]: %s", destinationFile, error)
+		log.Fatalf("file write[%s]: %s", destinationFile, error)
 	}
 
 	if verbose {
@@ -136,4 +169,106 @@ func fileExists(file string) bool {
 	}
 
 	return !info.IsDir()
+}
+
+func getFileContent(file string) string {
+	output, error := ioutil.ReadFile(file)
+
+	if error != nil {
+		log.Fatalf("file read[%s]: %s", file, error)
+	}
+
+	outputString := string(output)
+
+	return outputString	
+}
+
+func getFileFromCommit(file string, forkCommit string) string {
+	commitFile := forkCommit + ":" + file
+
+	output, error := exec.Command("git", "show", commitFile).Output()
+
+	if error != nil {
+		log.Fatalf("git show: %s", error)
+	}
+
+	return string(output)
+}
+
+// profile-diff
+
+func profileDifferential(oldContent string, newContent string) string {
+	oldChecksums := buildProfileChecksums(oldContent)
+	newChecksums := buildProfileChecksums(newContent)
+	newChecksumSortedKeys := sortKeys(newChecksums)
+
+	whitelist := map[string]bool{ "custom": true, "description": true, "fullName": true, "userLicense": true }
+	
+	var output = `<?xml version="1.0" encoding="UTF-8"?>
+<Profile xmlns="http://soap.sforce.com/2006/04/metadata">
+`
+
+	for _, checksum := range newChecksumSortedKeys {
+		newNode := newChecksums[checksum]
+		newNodeName := newNode.Data
+
+		_, exists := oldChecksums[checksum]
+
+		if !exists || whitelist[newNodeName] {
+			if !whitelist[newNodeName] {
+
+			}
+
+			newNodeXML := newNode.OutputXML(true)
+			output += newNodeXML + "\n"
+		}
+	}
+
+	output += `</Profile>`
+
+	return output
+}
+
+func sortKeys(items map[string]xmlquery.Node)[]string {
+	keys := make([]string, len(items))
+
+	i := 0
+	for key := range items {
+		keys[i] = key
+		i++
+	}
+
+	sort.Strings(keys)
+
+	return keys
+}
+
+func buildProfileChecksums(content string) map[string]xmlquery.Node {
+	doc, err := xmlquery.Parse(strings.NewReader(content))
+	if err != nil {
+		panic(err)
+	}
+
+	nodes := xmlquery.Find(doc, "//Profile/*")
+	checksums := make(map[string]xmlquery.Node)
+
+	for _, node := range nodes {
+		nodeXML := node.OutputXML(true)
+		nodeName := node.Data
+		sha256Hex := sha256Hex(nodeXML)
+
+		key := nodeName + "|" + sha256Hex
+		checksums[key] = *node
+	}
+
+	return checksums
+
+}
+
+func sha256Hex(content string) string {
+	contentBytes := []byte(content)
+	sha256Bytes := sha256.Sum256(contentBytes)
+	sha256Hex := hex.EncodeToString(sha256Bytes[:])
+
+	return sha256Hex
 }
