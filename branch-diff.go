@@ -38,6 +38,12 @@ var currentCommit string
 var parentBranch string
 var verbose bool
 
+var allOrNothingComponentTypes = map[string]bool {
+	"aura": true,
+	"experiences": true,
+	"lwc": true,
+}
+
 func main() {
 	initializeParameters()
 
@@ -92,19 +98,26 @@ func changeList(startCommit string, endCommit string) []string {
 	return lines
 }
 
-func copyFiles(files []string, directory string, forkCommit string) {
-	os.RemoveAll(directory)
+func copyFiles(files []string, suffix string, forkCommit string) {
+	os.RemoveAll(suffix)
 
 	if verbose {
-		fmt.Printf("Deleted directory: %s\n", directory)
+		fmt.Printf("Deleted directory: %s\n", suffix)
 	}
 
 	for _, file := range files {
+	
+		pathname := filterComponentFilename(file)
+	
 		if strings.HasSuffix(file, ".profile-meta.xml") {
 			content := profileDifferential(getFileFromCommit(file, forkCommit), getFileContent(file))
-			writeFile(file, directory, 0600, content)
+			writeFile(file, suffix, 0600, content)
 		} else {
-			copyFile(file, directory, 0600)
+			if isDirectory(pathname) {
+				copyDir(pathname, suffix)
+			} else {
+				copyFile(file, suffix, 0600)
+			}
 		}
 
 		if strings.HasSuffix(file, "-meta.xml") {
@@ -113,9 +126,86 @@ func copyFiles(files []string, directory string, forkCommit string) {
 
 		metaFile := file + "-meta.xml"
 		if fileExists(metaFile) {
-			copyFile(metaFile, directory, 0600)
+			copyFile(metaFile, suffix, 0600)
 		}
 	}
+}
+
+func filterComponentFilename(pathname string) string {
+	outputPathname := pathname
+	
+	fmt.Printf("Checking path = %s\n", filepath.Dir(pathname))
+	parts := strings.Split(filepath.Dir(pathname), string(os.PathSeparator))
+	
+	for i := 0; i < len(parts) - 1; i++ {
+		_, exists := allOrNothingComponentTypes[parts[i]]
+		
+		if exists {
+			fmt.Printf("i=%d, part=%s\n", i, parts[i])
+			outputPathname = pathSuffix(parts, i+1)
+		}
+	}
+	
+	return outputPathname
+}
+
+func pathSuffix(parts []string, count int) string {
+	var outputPathname string
+	
+	for i := 0; i <= count; i++ {
+		outputPathname = filepath.Join(outputPathname, parts[i])
+	}
+	
+	return outputPathname
+}
+
+func copyDir(pathname string, suffix string) {
+	fileinfo, error := os.Stat(pathname)
+	if error != nil {
+		fmt.Printf("WARNING [os.Stat(%s): %s\n", pathname, error)
+		return
+	}
+	if !fileinfo.IsDir() {
+		fmt.Errorf("source is not a directory")
+		return
+	}
+
+	destinationPathname := filepath.Join(suffix, pathname)
+
+	if isDirectory(destinationPathname) {
+		if verbose {
+			fmt.Printf("directory already exists[skipping]: %s\n", destinationPathname)
+		}
+		
+		return
+	}
+
+	error = os.MkdirAll(destinationPathname, fileinfo.Mode())
+	if error != nil {
+		return
+	}
+
+	nodes, error := ioutil.ReadDir(pathname)
+	if error != nil {
+		return
+	}
+
+	for _, node := range nodes {
+		srcPath := filepath.Join(pathname, node.Name())
+
+		if node.IsDir() {
+			copyDir(srcPath, suffix)
+		} else {
+			// Skip symlinks.
+			if node.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+
+			copyFile(srcPath, suffix, 0600)
+		}
+	}
+
+	return
 }
 
 func writeFile(file string, directory string, permissions uint32, content string) {
@@ -134,7 +224,16 @@ func writeFile(file string, directory string, permissions uint32, content string
 	if verbose {
 		fmt.Printf("Created file %s\n", destinationFile)
 	}
+}
 
+func isDirectory(pathname string) bool {
+	fileinfo, error := os.Stat(pathname)
+	
+	if error != nil {
+		return false
+	}
+	
+	return fileinfo.IsDir()
 }
 
 func copyFile(file string, directory string, permissions uint32) {
